@@ -10,18 +10,18 @@ import (
 	"fmt"
 	"log"
 	logging "logging"
+	"math/rand"
 	"os"
 	"strconv"
 	"sync"
 	"utils"
-	"math/rand"
 )
-
 
 const (
 	//defaultMsg      = "hello"
 	//defaultMsg		= "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmno1"
-	defaultMsg      = "abcdefg"
+	defaultMsg  = "abcdefg"
+	parallelism = 10
 
 	helpText_Client = `
     Main function for Client. Start a client and do write or read request. 
@@ -58,9 +58,46 @@ var ccidlist []int64
 var freq int
 var errr error
 
+func runInParallel(total int, workers int, task func()) {
+	if total <= 0 {
+		return
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if total < workers {
+		workers = total
+	}
 
-/* Initialize the client and send a write request to the system.
-   Rtype WRITEBATCH is currently used for evaluation only, which will send 10 (hard-coded) batches of requests, each with numReq length
+	base := total / workers
+	extra := total % workers
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		cnt := base
+		if w < extra {
+			cnt++
+		}
+		if cnt == 0 {
+			continue
+		}
+
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for i := 0; i < n; i++ {
+				task()
+			}
+		}(cnt)
+	}
+
+	wg.Wait()
+}
+
+/*
+Initialize the client and send a write request to the system.
+
+	Rtype WRITEBATCH is currently used for evaluation only, which will send 10 (hard-coded) batches of requests, each with numReq length
 */
 func startClient(cid string, msg []byte, wtype int, numReq int) {
 	log.Printf("** Client %s", cid)
@@ -71,14 +108,14 @@ func startClient(cid string, msg []byte, wtype int, numReq int) {
 	/*switch client.TypeOfTx[rtype] {
 	case pb.MessageType_WRITEBATCH:
 		client.SendWriteRequest(wType, uid, msg, []byte(""), 0)
-		
+
 		for i := 0; i < freq; i++ {
 			client.SendBatchRequests(wType, uid, msg, numReq, []byte(""), 0)
 		}
 	case pb.MessageType_WRITE:
-		
+
 		acrules, success := client.CreateACRules(ccidlist, cidlist)
-	
+
 		if !success{
 			log.Fatalf("Cannot create access control rules")
 		}
@@ -91,27 +128,27 @@ func startClient(cid string, msg []byte, wtype int, numReq int) {
 	}*/
 
 	//client.CloseConnections()
-	if wtype == 0{
-		for i := 0; i < numReq; i++ {
+	if wtype == 0 {
+		log.Printf("Starting parallel write, workers: %d, total requests: %d", parallelism, numReq)
+		runInParallel(numReq, parallelism, func() {
 			client.SendWriteRequest(msg)
-		}
-	}else if wtype == 1{
-		log.Printf("Starting a write batch, frequency: %v, size: %v,msg: %v",freq,numReq,msg)
-		for i := 0; i < freq; i++ {
-			client.SendBatchRequest(msg,numReq)
-		}
+		})
+	} else if wtype == 1 {
+		log.Printf("Starting parallel write batch, workers: %d, frequency: %v, size: %v,msg: %v", parallelism, freq, numReq, msg)
+		runInParallel(freq, parallelism, func() {
+			client.SendBatchRequest(msg, numReq)
+		})
 	}
 
 }
 
-func CreateMsg(msgsize int) []byte{
-	randbytes := make([]byte,msgsize)
+func CreateMsg(msgsize int) []byte {
+	randbytes := make([]byte, msgsize)
 	rand.Read(randbytes)
 	return randbytes
 }
 
-
-//TODO: The main function needs to be optimized for error control
+// TODO: The main function needs to be optimized for error control
 func main() {
 	//client.SetHomeDir()
 	helpPtr := flag.Bool("help", false, helpText_Client)
@@ -131,13 +168,13 @@ func main() {
 		return
 	}
 
-	_,validid := utils.StringToInt64(id)
-	if validid != nil{
+	_, validid := utils.StringToInt64(id)
+	if validid != nil {
 		log.Fatal("Invalid client ID!")
 	}
 
 	logging.SetID(id)
-	
+
 	rtype := 0 //Write
 
 	rtype, err = strconv.Atoi(os.Args[2])
@@ -154,8 +191,8 @@ func main() {
 		msg = []byte(os.Args[4])
 	}
 	if len(os.Args) > 5 {
-		freq,err = utils.StringToInt(os.Args[5])
-		if err != nil{
+		freq, err = utils.StringToInt(os.Args[5])
+		if err != nil {
 			log.Fatalf("Please enter a valid integer (number of frequency).")
 		}
 	}
@@ -171,7 +208,7 @@ func main() {
 	}
 	// Write, writebatch, data service
 	t1 := utils.MakeTimestamp()
-	startClient(id, msg, rtype,numReq)
+	startClient(id, msg, rtype, numReq)
 
 	t2 := utils.MakeTimestamp()
 	log.Printf("[Result for %d requests per client]\n\t-latency %d\n\t-throughput %d", numReq, t2-t1, numReq*1000/int(t2-t1))

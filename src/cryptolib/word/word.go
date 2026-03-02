@@ -1,3 +1,5 @@
+//go:build amd64
+
 package word
 
 func U16toByte_16(a uint16) (b []byte) {

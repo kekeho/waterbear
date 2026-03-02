@@ -7,6 +7,7 @@ import (
 	"logging"
 	"message"
 	"quorum"
+	"sync"
 	"time"
 	"utils"
 )
@@ -27,6 +28,74 @@ var baseinstance int
 
 var batchSize int
 var requestSize int
+var pendingReqLock sync.Mutex
+var pendingReqWaiters = make(map[string][]chan struct{})
+
+func RegisterPendingRequest(request []byte) chan struct{} {
+	ch := make(chan struct{})
+	key := utils.BytesToString(request)
+
+	pendingReqLock.Lock()
+	pendingReqWaiters[key] = append(pendingReqWaiters[key], ch)
+	pendingReqLock.Unlock()
+	return ch
+}
+
+func UnregisterPendingRequest(request []byte, ch chan struct{}) {
+	key := utils.BytesToString(request)
+	pendingReqLock.Lock()
+	defer pendingReqLock.Unlock()
+
+	waiters, exist := pendingReqWaiters[key]
+	if !exist || len(waiters) == 0 {
+		return
+	}
+
+	for i := 0; i < len(waiters); i++ {
+		if waiters[i] == ch {
+			waiters = append(waiters[:i], waiters[i+1:]...)
+			if len(waiters) == 0 {
+				delete(pendingReqWaiters, key)
+			} else {
+				pendingReqWaiters[key] = waiters
+			}
+			return
+		}
+	}
+}
+
+func MarkCommittedRequest(request []byte) {
+	key := utils.BytesToString(request)
+	var ch chan struct{}
+
+	pendingReqLock.Lock()
+	waiters, exist := pendingReqWaiters[key]
+	if exist && len(waiters) > 0 {
+		ch = waiters[0]
+		waiters = waiters[1:]
+		if len(waiters) == 0 {
+			delete(pendingReqWaiters, key)
+		} else {
+			pendingReqWaiters[key] = waiters
+		}
+	}
+	pendingReqLock.Unlock()
+
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func MarkCommittedBatch(rawBatch []byte) {
+	if rawBatch == nil {
+		return
+	}
+
+	rops := message.DeserializeRawOPS(rawBatch)
+	for i := 0; i < len(rops.OPS); i++ {
+		MarkCommittedRequest(rops.OPS[i].GetMsg())
+	}
+}
 
 func ExitEpoch() {
 	t2 := utils.MakeTimestamp()

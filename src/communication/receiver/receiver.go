@@ -7,8 +7,13 @@ package receiver
 
 import (
 	wb "aba/waterbear"
+	"broadcast/ecrbc"
+	"broadcast/rbc"
 	"communication"
 	"config"
+	"consensus"
+	"context"
+	"cryptolib"
 	"fmt"
 	"google.golang.org/grpc"
 	"log"
@@ -17,12 +22,7 @@ import (
 	"os"
 	pb "proto/proto/communication"
 	"sync"
-	"context"
-	"consensus"
 	"utils"
-	"cryptolib"
-	"broadcast/rbc"
-	"broadcast/ecrbc"
 
 	bit "aba/biasedit"
 	cobalt "aba/cobalt"
@@ -32,7 +32,7 @@ import (
 var id string
 var wg sync.WaitGroup
 var sleepTimerValue int
-var con int 
+var con int
 
 type server struct {
 	pb.UnimplementedSendServer
@@ -50,19 +50,17 @@ func (s *server) SendMsg(ctx context.Context, in *pb.RawMessage) (*pb.Empty, err
 	return &pb.Empty{}, nil
 }
 
-
 func (s *server) SendRequest(ctx context.Context, in *pb.Request) (*pb.RawMessage, error) {
-	return HandleRequest(in)
+	return HandleRequest(ctx, in)
 }
 
 func (s *reserver) SendRequest(ctx context.Context, in *pb.Request) (*pb.RawMessage, error) {
-	return HandleRequest(in)
+	return HandleRequest(ctx, in)
 }
 
-func HandleRequest(in *pb.Request) (*pb.RawMessage, error) {
+func HandleRequest(ctx context.Context, in *pb.Request) (*pb.RawMessage, error) {
 	/*h := cryptolib.GenHash(in.GetRequest())
 	rtype := in.GetType()*/
-
 
 	/*go handler.HandleRequest(in.GetRequest(), utils.BytesToString(h))
 
@@ -71,19 +69,44 @@ func HandleRequest(in *pb.Request) (*pb.RawMessage, error) {
 	go handler.GetResponseViaChan(utils.BytesToString(h), replies)
 	reply := <-replies*/
 	wtype := in.GetType()
-	switch wtype{
+	switch wtype {
 	case pb.MessageType_WRITE_BATCH:
-		consensus.HandleBatchRequest(in.GetRequest())
-		reply := []byte("batch rep")
+		requests := consensus.DeserializeRequests(in.GetRequest())
+		waiters := make([]chan struct{}, 0, len(requests))
+		for i := 0; i < len(requests); i++ {
+			waiters = append(waiters, consensus.RegisterPendingRequest(requests[i]))
+		}
 
+		consensus.HandleBatchRequest(in.GetRequest())
+
+		for i := 0; i < len(waiters); i++ {
+			select {
+			case <-waiters[i]:
+			case <-ctx.Done():
+				consensus.UnregisterPendingRequest(requests[i], waiters[i])
+				for j := i + 1; j < len(waiters); j++ {
+					consensus.UnregisterPendingRequest(requests[j], waiters[j])
+				}
+				return nil, ctx.Err()
+			}
+		}
+
+		reply := []byte("batch rep committed")
 		return &pb.RawMessage{Msg: reply}, nil
 	default:
-		h := cryptolib.GenHash(in.GetRequest())
-		go consensus.HandleRequest(in.GetRequest(), utils.BytesToString(h))
+		request := in.GetRequest()
+		h := cryptolib.GenHash(request)
+		waiter := consensus.RegisterPendingRequest(request)
+		go consensus.HandleRequest(request, utils.BytesToString(h))
 
-		reply := []byte("rep")
-
-		return &pb.RawMessage{Msg: reply}, nil
+		select {
+		case <-waiter:
+			reply := []byte("rep committed")
+			return &pb.RawMessage{Msg: reply}, nil
+		case <-ctx.Done():
+			consensus.UnregisterPendingRequest(request, waiter)
+			return nil, ctx.Err()
+		}
 	}
 
 }
@@ -98,9 +121,8 @@ func (s *server) ECRBCSendByteMsg(ctx context.Context, in *pb.RawMessage) (*pb.E
 	return &pb.Empty{}, nil
 }
 
-
 func (s *server) ABASendByteMsg(ctx context.Context, in *pb.RawMessage) (*pb.Empty, error) {
-	switch consensus.ConsensusType(con){
+	switch consensus.ConsensusType(con) {
 	case consensus.ITBFT:
 		go bit.HandleABAMsg(in.GetMsg())
 	case consensus.BEATCobalt:
@@ -110,7 +132,7 @@ func (s *server) ABASendByteMsg(ctx context.Context, in *pb.RawMessage) (*pb.Emp
 	default:
 		log.Fatalf("consensus type %v not supported in ABASendByteMsg function", con)
 	}
-	
+
 	return &pb.Empty{}, nil
 }
 
@@ -124,8 +146,8 @@ Handle join requests for both static membership (initialization) and dynamic mem
 Each replica gets a conformation for a membership request.
 */
 func (s *server) Join(ctx context.Context, in *pb.RawMessage) (*pb.RawMessage, error) {
-	
-	reply := []byte("hi")//handler.HandleJoinRequest(in.GetMsg())
+
+	reply := []byte("hi") //handler.HandleJoinRequest(in.GetMsg())
 	result := true
 
 	return &pb.RawMessage{Msg: reply, Result: result}, nil
@@ -158,7 +180,6 @@ Have serve grpc as a function (could be used together with goroutine)
 func serveGRPC(lis net.Listener, splitPort bool) {
 	defer wg.Done()
 
-
 	if splitPort {
 
 		s1 := grpc.NewServer(grpc.MaxRecvMsgSize(52428800), grpc.MaxSendMsgSize(52428800))
@@ -184,7 +205,6 @@ func serveGRPC(lis net.Listener, splitPort bool) {
 		os.Exit(1)
 	}
 
-
 }
 
 /*
@@ -193,18 +213,16 @@ Start receiver parameters initialization
 func StartReceiver(rid string, cons bool) {
 	id = rid
 	logging.SetID(rid)
-	
 
 	config.LoadConfig()
 	logging.SetLogOpt(config.FetchLogOpt())
 	con = config.Consensus()
 
 	sleepTimerValue = config.FetchSleepTimer()
-	if cons{
+	if cons {
 		consensus.StartHandler(rid)
 	}
-	
-	
+
 	if config.SplitPorts() {
 		//wg.Add(1)
 		go register(communication.GetPortNumber(config.FetchPort(rid)), true)
@@ -212,6 +230,5 @@ func StartReceiver(rid string, cons bool) {
 	wg.Add(1)
 	register(config.FetchPort(rid), false)
 	wg.Wait()
-
 
 }
